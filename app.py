@@ -72,8 +72,16 @@ def send_message(peer_id: int, message: str, keyboard_rows: Optional[List[List[s
     }
     if keyboard_rows:
         payload["keyboard"] = build_keyboard(keyboard_rows)
+
     response = requests.post("https://api.vk.ru/method/messages.send", data=payload, timeout=20)
     response.raise_for_status()
+
+    try:
+        data = response.json()
+        if "error" in data:
+            raise RuntimeError(f"VK API error: {data['error']}")
+    except ValueError:
+        pass
 
 
 def main_menu_message(first_name: str = "") -> str:
@@ -118,6 +126,7 @@ def progress_message(user_id: int) -> str:
     by_key = {row["module_key"]: row for row in modules}
     lines = [f"Твой прогресс\n\nБаллы: {points}"]
     completed = 0
+
     for key in MODULE_ORDER:
         module = MODULES[key]
         row = by_key.get(key)
@@ -127,6 +136,7 @@ def progress_message(user_id: int) -> str:
         if row and row["completed_at"]:
             completed += 1
         lines.append(f"\n{module['title']}:\n• изучение: {viewed}\n• мини-тест: {quiz}\n• рефлексия: {refl}")
+
     lines.append(f"\nЗавершено модулей: {completed} из {len(MODULE_ORDER)}")
     next_module = recommend_next_module(modules)
     if next_module:
@@ -157,8 +167,16 @@ def quiz_intro(module_key: str) -> str:
 def render_question(module_key: str, index: int) -> Tuple[str, List[List[str]]]:
     question = MODULES[module_key]["quiz"][index]
     options = question["options"]
-    rows = [[options[0]], [options[1]], [options[2]], ["Главное меню"]]
-    text = f"Вопрос {index + 1} из {len(MODULES[module_key]['quiz'])}:\n\n{question['question']}"
+
+    text = (
+        f"Вопрос {index + 1} из {len(MODULES[module_key]['quiz'])}:\n\n"
+        f"{question['question']}\n\n"
+        f"1. {options[0]}\n"
+        f"2. {options[1]}\n"
+        f"3. {options[2]}"
+    )
+
+    rows = [["1"], ["2"], ["3"], ["Главное меню"]]
     return text, rows
 
 
@@ -173,19 +191,24 @@ def parse_payload(payload: str) -> Dict[str, str]:
 
 def universal_reply(peer_id: int, text: str, first_name: str, user_id: int) -> bool:
     msg = normalize(text)
+
     if msg in {"начать", "старт", "start", "главное меню"}:
         clear_state(user_id)
         send_message(peer_id, main_menu_message(first_name), MAIN_MENU)
         return True
+
     if msg == "о проекте":
         send_message(peer_id, PROJECT_ABOUT, MAIN_MENU)
         return True
+
     if msg == "модули":
         send_message(peer_id, modules_message(), MODULE_BUTTONS)
         return True
+
     if msg == "мой прогресс":
         send_message(peer_id, progress_message(user_id), MAIN_MENU)
         return True
+
     if msg == "помощь":
         send_message(
             peer_id,
@@ -198,9 +221,11 @@ def universal_reply(peer_id: int, text: str, first_name: str, user_id: int) -> b
             MAIN_MENU,
         )
         return True
+
     if msg == "открыть ресурс":
         send_message(peer_id, f"Открой образовательный ресурс: {RESOURCE_URL}", MODULE_MENU)
         return True
+
     if msg in TEXT_TO_MODULE:
         module_key = TEXT_TO_MODULE[msg]
         first_open = mark_viewed(user_id, module_key)
@@ -209,6 +234,7 @@ def universal_reply(peer_id: int, text: str, first_name: str, user_id: int) -> b
         set_state(user_id, "module", f"module={module_key}")
         send_message(peer_id, module_card(module_key), MODULE_MENU)
         return True
+
     return False
 
 
@@ -225,19 +251,24 @@ def handle_state(user_id: int, peer_id: int, text: str) -> bool:
         module_key = payload.get("module")
         if not module_key:
             return False
+
         command = normalize(msg)
+
         if command == "цель":
             send_message(peer_id, about_module_goal(module_key), MODULE_MENU)
             return True
+
         if command == "задание":
             send_message(peer_id, about_module_task(module_key), MODULE_MENU)
             return True
+
         if command == "мини-тест":
-            set_state(user_id, "quiz", f"module={module_key}|index=0|score=0")
             intro = quiz_intro(module_key)
             question_text, rows = render_question(module_key, 0)
             send_message(peer_id, f"{intro}\n\n{question_text}", rows)
+            set_state(user_id, "quiz", f"module={module_key}|index=0|score=0")
             return True
+
         if command == "рефлексия":
             set_state(user_id, "reflection", f"module={module_key}")
             send_message(
@@ -246,42 +277,70 @@ def handle_state(user_id: int, peer_id: int, text: str) -> bool:
                 [["Главное меню"]],
             )
             return True
+
         return False
 
     if state == "quiz":
         module_key = payload.get("module")
         index = int(payload.get("index", 0))
         score = int(payload.get("score", 0))
+
         if not module_key:
             return False
-        current = MODULES[module_key]["quiz"][index]
-        if msg == current["correct"]:
-            score += 1
-        index += 1
+
         if index >= len(MODULES[module_key]["quiz"]):
-            first_pass = save_quiz_result(user_id, module_key, score, len(MODULES[module_key]["quiz"]))
+            set_state(user_id, "module", f"module={module_key}")
+            send_message(peer_id, "Тест уже завершён. Выбери следующее действие.", MODULE_MENU)
+            return True
+
+        current = MODULES[module_key]["quiz"][index]
+        options = current["options"]
+
+        answer_map = {
+            "1": options[0],
+            "2": options[1],
+            "3": options[2],
+        }
+
+        selected_answer = answer_map.get(msg.strip())
+        if selected_answer is None:
+            send_message(peer_id, "Пожалуйста, выбери один из вариантов: 1, 2 или 3.", [["1"], ["2"], ["3"], ["Главное меню"]])
+            return True
+
+        if selected_answer == current["correct"]:
+            score += 1
+
+        index += 1
+
+        if index >= len(MODULES[module_key]["quiz"]):
+            total = len(MODULES[module_key]["quiz"])
+            first_pass = save_quiz_result(user_id, module_key, score, total)
             if first_pass:
                 add_points(user_id, 5)
-            set_state(user_id, "module", f"module={module_key}")
+
             send_message(
                 peer_id,
-                f"Тест завершен. Результат: {score}/{len(MODULES[module_key]['quiz'])}.\n\n"
+                f"Тест завершен. Результат: {score}/{total}.\n\n"
                 "Чтобы модуль считался завершенным, осталось написать рефлексию.",
                 MODULE_MENU,
             )
+            set_state(user_id, "module", f"module={module_key}")
             return True
-        set_state(user_id, "quiz", f"module={module_key}|index={index}|score={score}")
+
         question_text, rows = render_question(module_key, index)
         send_message(peer_id, question_text, rows)
+        set_state(user_id, "quiz", f"module={module_key}|index={index}|score={score}")
         return True
 
     if state == "reflection":
         module_key = payload.get("module")
         if not module_key:
             return False
+
         first_reflection = save_reflection(user_id, module_key, msg)
         if first_reflection:
             add_points(user_id, 3)
+
         set_state(user_id, "module", f"module={module_key}")
         send_message(
             peer_id,
@@ -321,17 +380,27 @@ def vk_callback():
 
         first_name = ""
         last_name = ""
-        if isinstance(obj.get("client_info"), dict):
-            pass
         ensure_user(user_id, first_name, last_name)
 
-        if not universal_reply(peer_id, text, first_name, user_id):
-            if not handle_state(user_id, peer_id, text):
+        try:
+            if not universal_reply(peer_id, text, first_name, user_id):
+                if not handle_state(user_id, peer_id, text):
+                    send_message(
+                        peer_id,
+                        "Я пока не понял сообщение. Нажми «Главное меню» или «Модули», чтобы продолжить.",
+                        MAIN_MENU,
+                    )
+        except Exception as e:
+            print(f"ERROR while handling message: {e}")
+            try:
                 send_message(
                     peer_id,
-                    "Я пока не понял сообщение. Нажми «Главное меню» или «Модули», чтобы продолжить.",
+                    "Произошла небольшая ошибка. Нажми «Главное меню» и попробуй ещё раз.",
                     MAIN_MENU,
                 )
+            except Exception as inner_e:
+                print(f"ERROR while sending fallback message: {inner_e}")
+
         return "ok"
 
     return "ok"
